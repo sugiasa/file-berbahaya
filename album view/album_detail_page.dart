@@ -1,9 +1,16 @@
+// ignore_for_file: use_key_in_widget_constructors, prefer_const_constructors_in_immutables, library_private_types_in_public_api, use_build_context_synchronously, unrelated_type_equality_checks
+
 import 'dart:ui';
+import 'package:blurspace/utils/colors.dart';
+import 'package:blurspace/utils/snackbar_utils.dart';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
-import 'media_viewer_page.dart'; // Pastikan file ini ada
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'media_viewer_page.dart';
+import '../providers/cache_manager.dart';
 
 class AlbumDetailPage extends StatefulWidget {
   final String albumId;
@@ -16,18 +23,91 @@ class AlbumDetailPage extends StatefulWidget {
 
 class _AlbumDetailPageState extends State<AlbumDetailPage> {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final CacheManager _cacheManager = CacheManager();
+
   bool isLoading = true;
+  bool isOffline = false;
   Map<String, dynamic> albumData = {};
   List<Map<String, dynamic>> mediaList = [];
   bool isGridView = true; // Default view is grid
-  
-  // Cache for downloaded media
-  Map<String, dynamic> cachedMedia = {};
 
   @override
   void initState() {
     super.initState();
-    fetchAlbumDetails();
+    _initData();
+  }
+
+  Future<void> _initData() async {
+    // Check connectivity
+    final connectivityResult = await Connectivity().checkConnectivity();
+    final hasConnection = connectivityResult != ConnectivityResult.none;
+
+    setState(() {
+      isOffline = !hasConnection;
+    });
+
+    // Try to load cached data first
+    await _loadCachedData();
+
+    // Then try to fetch fresh data if online
+    if (hasConnection) {
+      await fetchAlbumDetails();
+    } else {
+      setState(() {
+        isLoading = false;
+      });
+
+      // Show offline notification
+      if (mounted && mediaList.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('You are offline. Connect to view this album.'),
+            backgroundColor: Colors.orange,
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _loadCachedData() async {
+    try {
+      // Load cached media info for this album
+      final cachedMedia = await _cacheManager.getCachedMediaInfo(
+        widget.albumId,
+      );
+
+      if (cachedMedia != null && cachedMedia.isNotEmpty) {
+        // Update download status for each media
+        final updatedMedia = await Future.wait(
+          cachedMedia.map((media) async {
+            final mediaId = media['mediaId'];
+            final isDownloaded = await _cacheManager.isMediaCached(mediaId);
+            return {
+              ...media,
+              'isDownloaded': isDownloaded,
+              'isDownloading': false,
+            };
+          }),
+        );
+
+        setState(() {
+          mediaList = updatedMedia.cast<Map<String, dynamic>>();
+
+          // Set basic album info if we have media
+          if (mediaList.isNotEmpty && albumData.isEmpty) {
+            albumData = {
+              'title': 'Cached Album',
+              'description': 'Offline content',
+            };
+          }
+
+          isLoading = false;
+        });
+      }
+    } catch (e) {
+      debugPrint('Error loading cached data: $e');
+    }
   }
 
   Future<void> fetchAlbumDetails() async {
@@ -37,74 +117,113 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
 
     try {
       // Fetch album data
-      final DocumentSnapshot albumDoc = await _firestore
-          .collection('albums')
-          .doc(widget.albumId)
-          .get();
+      final DocumentSnapshot albumDoc =
+          await _firestore.collection('albums').doc(widget.albumId).get();
 
       if (!albumDoc.exists) {
         throw Exception('Album not found');
       }
 
-      final Map<String, dynamic> album = albumDoc.data() as Map<String, dynamic>;
-      
+      final Map<String, dynamic> album =
+          albumDoc.data() as Map<String, dynamic>;
+
       // Check if album is locked
       if (album['isLocked'] == true) {
         throw Exception('Album is locked');
       }
 
       // Fetch all media in the album
-      final QuerySnapshot mediaSnapshot = await _firestore
-          .collection('albums')
-          .doc(widget.albumId)
-          .collection('media')
-          .get();
+      final QuerySnapshot mediaSnapshot =
+          await _firestore
+              .collection('albums')
+              .doc(widget.albumId)
+              .collection('media')
+              .get();
 
       final List<Map<String, dynamic>> media = [];
-      
+
+      // Check which media files are already cached
       for (final doc in mediaSnapshot.docs) {
-        final Map<String, dynamic> mediaData = doc.data() as Map<String, dynamic>;
+        final String mediaId = doc.id;
+        final Map<String, dynamic> mediaData =
+            doc.data() as Map<String, dynamic>;
+
+        // Check if the media is cached
+        final bool isDownloaded = await _cacheManager.isMediaCached(mediaId);
+
         media.add({
           ...mediaData,
-          'mediaId': doc.id,
-          'isDownloaded': false, // Initially not downloaded
+          'mediaId': mediaId,
+          'isDownloaded': isDownloaded,
+          'isDownloading': false,
         });
       }
+
+      // Cache the media info for offline access
+      await _cacheManager.cacheMediaInfo(widget.albumId, media);
 
       setState(() {
         albumData = album;
         mediaList = media;
         isLoading = false;
+        isOffline = false;
       });
     } catch (e) {
-      print('Error fetching album details: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: ${e.toString()}')),
-      );
+      debugPrint('Error fetching album details: $e');
+
+      // If fetching fails but we have cached media, use that
+      if (mediaList.isEmpty) {
+        await _loadCachedData();
+      }
+
       setState(() {
         isLoading = false;
+        isOffline = true;
       });
-      
-      // Navigate back on error
-      Future.delayed(Duration(milliseconds: 1500), () {
-        Navigator.pop(context);
-      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error: ${e.toString()}'),
+          backgroundColor: Colors.red,
+        ),
+      );
+
+      // Navigate back on severe error
+      if (mediaList.isEmpty) {
+        Future.delayed(Duration(milliseconds: 1500), () {
+          Navigator.pop(context);
+        });
+      }
     }
   }
 
-  // Function to cache media (simulated download)
+  // Function to download media
   Future<void> downloadMedia(int index) async {
     final media = mediaList[index];
     final mediaId = media['mediaId'];
-    
+    final String mediaUrl = media['mediaUrl'];
+    final String mediaType = media['mediaType'];
+
     // Only allow download for non-premium content
     if (media['isPremium'] == true) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Premium content requires subscription')),
+        SnackBar(
+          content: Text('Premium content requires subscription'),
+          backgroundColor: error,
+        ),
       );
       return;
     }
-    
+
+    // Check connectivity
+    final connectivityResult = await Connectivity().checkConnectivity();
+    if (connectivityResult == ConnectivityResult.none) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Cannot download while offline')));
+      return;
+    }
+
     // Set downloading state
     setState(() {
       List<Map<String, dynamic>> updatedMediaList = List.from(mediaList);
@@ -114,18 +233,19 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
       };
       mediaList = updatedMediaList;
     });
-    
+
     try {
-      // Simulate network delay for downloading
-      await Future.delayed(Duration(seconds: 1));
-      
-      // Cache the media URL
-      cachedMedia[mediaId] = {
-        'mediaUrl': media['mediaUrl'],
-        'mediaType': media['mediaType'],
-        'name': media['name'],
-      };
-      
+      // Download and cache the media
+      final filePath = await _cacheManager.downloadAndCacheMedia(
+        mediaId,
+        mediaUrl,
+        mediaType,
+      );
+
+      if (filePath == null) {
+        throw Exception('Failed to download media');
+      }
+
       // Update state
       setState(() {
         List<Map<String, dynamic>> updatedMediaList = List.from(mediaList);
@@ -133,18 +253,24 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
           ...updatedMediaList[index],
           'isDownloaded': true,
           'isDownloading': false,
+          'localPath': filePath,
         };
         mediaList = updatedMediaList;
       });
-      
+
+      // Update cached media info
+      await _cacheManager.cacheMediaInfo(widget.albumId, mediaList);
+
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Media cached successfully')),
+        SnackBar(content: Text('Media downloaded for offline use')),
       );
     } catch (e) {
+      debugPrint('Error downloading media: $e');
+
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to cache media: $e')),
+        SnackBar(content: Text('Failed to download media: ${e.toString()}')),
       );
-      
+
       setState(() {
         List<Map<String, dynamic>> updatedMediaList = List.from(mediaList);
         updatedMediaList[index] = {
@@ -160,10 +286,50 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(isLoading ? 'Loading...' : albumData['title'] ?? 'Album'),
+        // backgroundColor: Colors.black, // ganti sesuai tema lu
+        automaticallyImplyLeading: false, // matiin default back button
+        leading: IconButton(
+          icon: Icon(
+            Icons.arrow_back_rounded,
+            color: white,
+          ), // ganti icon sesuka lu
+          onPressed: () {
+            Navigator.of(context).pop(); // atau custom logic lu
+          },
+        ),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              isLoading ? 'Loading...' : '${albumData['title']}',
+              style: GoogleFonts.roboto(
+                fontSize: 24,
+                color: white,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            Text(
+              'Total media: ${mediaList.length}',
+              style: GoogleFonts.roboto(
+                fontWeight: FontWeight.w500,
+                fontSize: 12,
+                color: white,
+              ),
+            ),
+          ],
+        ),
         actions: [
+          if (isOffline)
+            IconButton(
+              icon: Icon(Icons.cloud_off, color: white),
+              tooltip: 'Offline Mode',
+              onPressed: null,
+            ),
           IconButton(
-            icon: Icon(isGridView ? Icons.view_list : Icons.grid_view),
+            icon: Icon(
+              isGridView ? Icons.view_agenda_rounded : Icons.grid_view_rounded,
+              color: white,
+            ),
             onPressed: () {
               setState(() {
                 isGridView = !isGridView;
@@ -171,19 +337,60 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
             },
             tooltip: isGridView ? 'Switch to List View' : 'Switch to Grid View',
           ),
-          IconButton(
-            icon: Icon(Icons.refresh),
-            onPressed: fetchAlbumDetails,
-          ),
         ],
       ),
-      body: isLoading
-          ? Center(child: CircularProgressIndicator())
-          : mediaList.isEmpty
+      body:
+          isLoading
+              ? Center(child: CircularProgressIndicator())
+              : mediaList.isEmpty
               ? _buildEmptyState()
-              : isGridView
-                  ? _buildGridView()
-                  : _buildListView(),
+              : Column(
+                children: [
+                  // Offline banner
+                  if (isOffline)
+                    Container(
+                      padding: EdgeInsets.symmetric(
+                        vertical: 8,
+                        horizontal: 16,
+                      ),
+                      color: Colors.orange.withOpacity(0.1),
+                      child: Row(
+                        children: [
+                          Icon(Icons.cloud_off, size: 16, color: Colors.orange),
+                          SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Offline mode. Only downloaded content is available.',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.orange.shade800,
+                              ),
+                            ),
+                          ),
+                          TextButton(
+                            onPressed: () => _initData(),
+                            child: Text(
+                              'Retry',
+                              style: TextStyle(fontSize: 12),
+                            ),
+                            style: TextButton.styleFrom(
+                              padding: EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
+                              minimumSize: Size(0, 0),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+
+                  // Media content
+                  Expanded(
+                    child: isGridView ? _buildGridView() : _buildListView(),
+                  ),
+                ],
+              ),
     );
   }
 
@@ -192,20 +399,30 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.photo_library_outlined, size: 64, color: Colors.grey),
+          Icon(
+            isOffline ? Icons.cloud_off : Icons.photo_library_outlined,
+            size: 64,
+            color: Colors.grey,
+          ),
           SizedBox(height: 16),
           Text(
-            'No Media Found',
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-            ),
+            isOffline ? 'No Downloaded Content' : 'No Media Found',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
           ),
           SizedBox(height: 8),
           Text(
-            'This album is empty',
+            isOffline
+                ? 'Connect to the internet to view this album'
+                : 'This album is empty',
             style: TextStyle(color: Colors.grey),
           ),
+          SizedBox(height: 24),
+          if (isOffline)
+            ElevatedButton.icon(
+              icon: Icon(Icons.refresh),
+              label: Text('Check Connection'),
+              onPressed: () => _initData(),
+            ),
         ],
       ),
     );
@@ -213,7 +430,7 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
 
   Widget _buildGridView() {
     return RefreshIndicator(
-      onRefresh: fetchAlbumDetails,
+      onRefresh: () => _initData(),
       child: GridView.builder(
         padding: EdgeInsets.all(8),
         gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
@@ -228,28 +445,35 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
           final bool isPremium = media['isPremium'] ?? false;
           final bool isDownloaded = media['isDownloaded'] ?? false;
           final bool isDownloading = media['isDownloading'] ?? false;
-          
+
           return GestureDetector(
             onTap: () {
               if (isPremium) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text('Premium content requires subscription')),
+                ErrorGlobalSnackbar.show(
+                  context,
+                  message: 'Premium content requires subscription',
                 );
               } else if (isDownloaded) {
                 Navigator.push(
                   context,
                   MaterialPageRoute(
-                    builder: (context) => MediaViewerPage(
-                      albumId: widget.albumId,
-                      initialMediaIndex: index,
-                      mediaList: mediaList,
-                      cachedMedia: cachedMedia,
-                    ),
+                    builder:
+                        (context) => MediaViewerPage(
+                          albumId: widget.albumId,
+                          initialMediaIndex: index,
+                          mediaList: mediaList,
+                        ),
                   ),
                 );
-              } else {
-                // Start download if not premium and not downloaded
+              } else if (!isOffline) {
+                // Start download if not premium, not downloaded, and online
                 downloadMedia(index);
+              } else {
+                // Offline and not downloaded
+                ErrorGlobalSnackbar.show(
+                  context,
+                  message: 'Connect to the internet to download content',
+                );
               }
             },
             child: Container(
@@ -265,36 +489,33 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                   CachedNetworkImage(
                     imageUrl: media['thumbnailUrl'] ?? '',
                     fit: BoxFit.cover,
-                    placeholder: (context, url) => Center(
-                      child: CircularProgressIndicator(),
-                    ),
-                    errorWidget: (context, url, error) => Center(
-                      child: Icon(
-                        media['mediaType'] == 'video'
-                            ? Icons.video_file
-                            : Icons.image,
-                        size: 40,
-                        color: Colors.grey,
-                      ),
-                    ),
+                    placeholder:
+                        (context, url) =>
+                            Center(child: CircularProgressIndicator()),
+                    errorWidget:
+                        (context, url, error) => Center(
+                          child: Icon(
+                            media['mediaType'] == 'video'
+                                ? Icons.video_file
+                                : Icons.image,
+                            size: 40,
+                            color: white,
+                          ),
+                        ),
                   ),
-                  
+
                   // Blur effect for premium content
                   if (isPremium)
                     ClipRRect(
                       child: BackdropFilter(
                         filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
                         child: Container(
-                          color: Colors.black.withOpacity(0.3),
+                          color: black.withAlpha(90),
                           child: Center(
                             child: Column(
                               mainAxisAlignment: MainAxisAlignment.center,
                               children: [
-                                Icon(
-                                  Icons.lock,
-                                  color: Colors.white,
-                                  size: 32,
-                                ),
+                                Icon(Icons.lock, color: Colors.white, size: 32),
                                 SizedBox(height: 8),
                                 Container(
                                   padding: EdgeInsets.symmetric(
@@ -302,12 +523,12 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                                     vertical: 6,
                                   ),
                                   decoration: BoxDecoration(
-                                    color: Colors.amber.shade700,
+                                    color: blue,
                                     borderRadius: BorderRadius.circular(16),
                                   ),
                                   child: Text(
                                     'PREMIUM',
-                                    style: TextStyle(
+                                    style: GoogleFonts.poppins(
                                       color: Colors.white,
                                       fontWeight: FontWeight.bold,
                                       fontSize: 12,
@@ -320,57 +541,89 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                         ),
                       ),
                     ),
-                  
-                  // Download button
-                  if (!isPremium && !isDownloaded)
-                    Positioned(
-                      right: 8,
-                      top: 8,
-                      child: GestureDetector(
-                        onTap: isDownloading ? null : () => downloadMedia(index),
+
+                  // Offline indicator for non-downloaded content
+                  if (isOffline && !isDownloaded && !isPremium)
+                    ClipRect(
+                      child: BackdropFilter(
+                        filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
                         child: Container(
-                          padding: EdgeInsets.all(8),
-                          decoration: BoxDecoration(
-                            color: Colors.black.withOpacity(0.6),
-                            shape: BoxShape.circle,
-                          ),
-                          child: isDownloading
-                              ? SizedBox(
-                                  width: 24,
-                                  height: 24,
-                                  child: CircularProgressIndicator(
-                                    color: Colors.white,
-                                    strokeWidth: 2,
-                                  ),
-                                )
-                              : Icon(
-                                  Icons.download,
+                          color: black.withAlpha(90),
+                          child: Center(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(
+                                  Icons.cloud_off,
                                   color: Colors.white,
-                                  size: 24,
+                                  size: 32,
                                 ),
+                                SizedBox(height: 8),
+                                Text(
+                                  'Offline',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
                         ),
                       ),
                     ),
-                  
+
+                  // Download button
+                  if (!isPremium && !isDownloaded && !isOffline)
+                    GestureDetector(
+                      onTap: isDownloading ? null : () => downloadMedia(index),
+                      child: ClipRect(
+                        child: BackdropFilter(
+                          filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+                          child: Container(
+                            width: 200,
+                            height: 20,
+                            padding: EdgeInsets.all(8),
+                            decoration: BoxDecoration(
+                              color: black.withAlpha(40),
+                              // shape: BoxShape.circle,
+                            ),
+                            child:
+                                isDownloading
+                                    ? SizedBox(
+                                      width: 24,
+                                      height: 24,
+                                      child: CircularProgressIndicator(
+                                        color: Colors.white,
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                    : Icon(
+                                      Icons.download_rounded,
+                                      color: Colors.white,
+                                      size: 30,
+                                    ),
+                          ),
+                        ),
+                      ),
+                    ),
+
                   // Downloaded indicator
-                  if (isDownloaded)
-                    Positioned(
-                      right: 8,
-                      top: 8,
-                      child: Container(
-                        padding: EdgeInsets.all(8),
-                        decoration: BoxDecoration(
-                          color: Colors.green.withOpacity(0.8),
-                          shape: BoxShape.circle,
-                        ),
-                        child: Icon(
-                          Icons.check,
-                          color: Colors.white,
-                          size: 24,
-                        ),
-                      ),
-                    ),
-                  
+                  // if (isDownloaded)
+                  //   Positioned(
+                  //     right: 8,
+                  //     top: 8,
+                  //     child: Container(
+                  //       padding: EdgeInsets.all(8),
+                  //       decoration: BoxDecoration(
+                  //         color: Colors.green.withOpacity(0.8),
+                  //         shape: BoxShape.circle,
+                  //       ),
+                  //       child: Icon(Icons.check, color: Colors.white, size: 24),
+                  //     ),
+                  //   ),
+
                   // Media type and info
                   Positioned(
                     left: 8,
@@ -394,10 +647,7 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                           ),
                           Text(
                             '${(media['size'] / (1024 * 1024)).toStringAsFixed(1)} MB',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 12,
-                            ),
+                            style: TextStyle(color: Colors.white, fontSize: 12),
                           ),
                         ],
                       ),
@@ -414,7 +664,7 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
 
   Widget _buildListView() {
     return RefreshIndicator(
-      onRefresh: fetchAlbumDetails,
+      onRefresh: () => _initData(),
       child: ListView.builder(
         padding: EdgeInsets.all(16),
         itemCount: mediaList.length,
@@ -423,7 +673,7 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
           final bool isPremium = media['isPremium'] ?? false;
           final bool isDownloaded = media['isDownloaded'] ?? false;
           final bool isDownloading = media['isDownloading'] ?? false;
-          
+
           // Format date if available
           String formattedDate = '';
           if (media['createdAt'] != null) {
@@ -434,28 +684,39 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
               formattedDate = '';
             }
           }
-          
+
           return GestureDetector(
             onTap: () {
               if (isPremium) {
                 ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text('Premium content requires subscription')),
+                  SnackBar(
+                    content: Text('Premium content requires subscription'),
+                  ),
                 );
               } else if (isDownloaded) {
                 Navigator.push(
                   context,
                   MaterialPageRoute(
-                    builder: (context) => MediaViewerPage(
-                      albumId: widget.albumId,
-                      initialMediaIndex: index,
-                      mediaList: mediaList,
-                      cachedMedia: cachedMedia,
+                    builder:
+                        (context) => MediaViewerPage(
+                          albumId: widget.albumId,
+                          initialMediaIndex: index,
+                          mediaList: mediaList,
+                        ),
+                  ),
+                );
+              } else if (!isOffline) {
+                // Start download if not premium, not downloaded, and online
+                downloadMedia(index);
+              } else {
+                // Offline and not downloaded
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(
+                      'Connect to the internet to download content',
                     ),
                   ),
                 );
-              } else {
-                // Start download if not premium and not downloaded
-                downloadMedia(index);
               }
             },
             child: Card(
@@ -478,20 +739,21 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                         CachedNetworkImage(
                           imageUrl: media['thumbnailUrl'] ?? '',
                           fit: BoxFit.cover,
-                          placeholder: (context, url) => Center(
-                            child: CircularProgressIndicator(),
-                          ),
-                          errorWidget: (context, url, error) => Center(
-                            child: Icon(
-                              media['mediaType'] == 'video'
-                                  ? Icons.video_file
-                                  : Icons.image,
-                              size: 64,
-                              color: Colors.grey,
-                            ),
-                          ),
+                          placeholder:
+                              (context, url) =>
+                                  Center(child: CircularProgressIndicator()),
+                          errorWidget:
+                              (context, url, error) => Center(
+                                child: Icon(
+                                  media['mediaType'] == 'video'
+                                      ? Icons.video_file
+                                      : Icons.image,
+                                  size: 64,
+                                  color: Colors.grey,
+                                ),
+                              ),
                         ),
-                        
+
                         // Blur effect for premium content
                         if (isPremium)
                           ClipRRect(
@@ -516,7 +778,9 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                                         ),
                                         decoration: BoxDecoration(
                                           color: Colors.amber.shade700,
-                                          borderRadius: BorderRadius.circular(20),
+                                          borderRadius: BorderRadius.circular(
+                                            20,
+                                          ),
                                         ),
                                         child: Text(
                                           'PREMIUM ACCESS ONLY',
@@ -533,9 +797,46 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                               ),
                             ),
                           ),
-                        
+
+                        // Offline indicator for non-downloaded content
+                        if (isOffline && !isDownloaded && !isPremium)
+                          Container(
+                            color: Colors.black.withOpacity(0.5),
+                            child: Center(
+                              child: Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Icon(
+                                    Icons.cloud_off,
+                                    color: Colors.white,
+                                    size: 48,
+                                  ),
+                                  SizedBox(height: 16),
+                                  Text(
+                                    'OFFLINE',
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  SizedBox(height: 8),
+                                  Text(
+                                    'Connect to download',
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 14,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+
                         // Media type indicator
-                        if (media['mediaType'] == 'video' && !isPremium)
+                        if (media['mediaType'] == 'video' &&
+                            !isPremium &&
+                            (!isOffline || isDownloaded))
                           Center(
                             child: Container(
                               padding: EdgeInsets.all(16),
@@ -550,38 +851,42 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                               ),
                             ),
                           ),
-                        
+
                         // Download button
-                        if (!isPremium && !isDownloaded)
+                        if (!isPremium && !isDownloaded && !isOffline)
                           Positioned(
                             right: 16,
                             top: 16,
                             child: GestureDetector(
-                              onTap: isDownloading ? null : () => downloadMedia(index),
+                              onTap:
+                                  isDownloading
+                                      ? null
+                                      : () => downloadMedia(index),
                               child: Container(
                                 padding: EdgeInsets.all(12),
                                 decoration: BoxDecoration(
                                   color: Colors.black.withOpacity(0.6),
                                   shape: BoxShape.circle,
                                 ),
-                                child: isDownloading
-                                    ? SizedBox(
-                                        width: 24,
-                                        height: 24,
-                                        child: CircularProgressIndicator(
+                                child:
+                                    isDownloading
+                                        ? SizedBox(
+                                          width: 24,
+                                          height: 24,
+                                          child: CircularProgressIndicator(
+                                            color: Colors.white,
+                                            strokeWidth: 2,
+                                          ),
+                                        )
+                                        : Icon(
+                                          Icons.download,
                                           color: Colors.white,
-                                          strokeWidth: 2,
+                                          size: 28,
                                         ),
-                                      )
-                                    : Icon(
-                                        Icons.download,
-                                        color: Colors.white,
-                                        size: 28,
-                                      ),
                               ),
                             ),
                           ),
-                        
+
                         // Downloaded indicator
                         if (isDownloaded)
                           Positioned(
@@ -633,17 +938,22 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                                           vertical: 2,
                                         ),
                                         decoration: BoxDecoration(
-                                          color: media['mediaType'] == 'video'
-                                              ? Colors.blue.shade100
-                                              : Colors.green.shade100,
-                                          borderRadius: BorderRadius.circular(4),
+                                          color:
+                                              media['mediaType'] == 'video'
+                                                  ? Colors.blue.shade100
+                                                  : Colors.green.shade100,
+                                          borderRadius: BorderRadius.circular(
+                                            4,
+                                          ),
                                         ),
                                         child: Text(
-                                          media['mediaType']?.toUpperCase() ?? 'UNKNOWN',
+                                          media['mediaType']?.toUpperCase() ??
+                                              'UNKNOWN',
                                           style: TextStyle(
-                                            color: media['mediaType'] == 'video'
-                                                ? Colors.blue.shade800
-                                                : Colors.green.shade800,
+                                            color:
+                                                media['mediaType'] == 'video'
+                                                    ? Colors.blue.shade800
+                                                    : Colors.green.shade800,
                                             fontSize: 12,
                                             fontWeight: FontWeight.bold,
                                           ),
@@ -675,41 +985,82 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                                   ),
                                 ),
                                 SizedBox(height: 4),
-                                if (isPremium)
-                                  Container(
-                                    padding: EdgeInsets.symmetric(
-                                      horizontal: 8,
-                                      vertical: 2,
-                                    ),
-                                    decoration: BoxDecoration(
-                                      color: Colors.amber.shade100,
-                                      borderRadius: BorderRadius.circular(4),
-                                    ),
-                                    child: Row(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        Icon(
-                                          Icons.star,
-                                          size: 12,
-                                          color: Colors.amber.shade800,
+                                Row(
+                                  children: [
+                                    if (isPremium)
+                                      Container(
+                                        padding: EdgeInsets.symmetric(
+                                          horizontal: 8,
+                                          vertical: 2,
                                         ),
-                                        SizedBox(width: 4),
-                                        Text(
-                                          'PREMIUM',
-                                          style: TextStyle(
-                                            color: Colors.amber.shade800,
-                                            fontSize: 10,
-                                            fontWeight: FontWeight.bold,
+                                        decoration: BoxDecoration(
+                                          color: Colors.amber.shade100,
+                                          borderRadius: BorderRadius.circular(
+                                            4,
                                           ),
                                         ),
-                                      ],
-                                    ),
-                                  ),
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            Icon(
+                                              Icons.star,
+                                              size: 12,
+                                              color: Colors.amber.shade800,
+                                            ),
+                                            SizedBox(width: 4),
+                                            Text(
+                                              'PREMIUM',
+                                              style: TextStyle(
+                                                color: Colors.amber.shade800,
+                                                fontSize: 10,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    if (isDownloaded)
+                                      Container(
+                                        margin: EdgeInsets.only(
+                                          left: isPremium ? 8 : 0,
+                                        ),
+                                        padding: EdgeInsets.symmetric(
+                                          horizontal: 8,
+                                          vertical: 2,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: Colors.green.shade100,
+                                          borderRadius: BorderRadius.circular(
+                                            4,
+                                          ),
+                                        ),
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            Icon(
+                                              Icons.download_done,
+                                              size: 12,
+                                              color: Colors.green.shade800,
+                                            ),
+                                            SizedBox(width: 4),
+                                            Text(
+                                              'SAVED',
+                                              style: TextStyle(
+                                                color: Colors.green.shade800,
+                                                fontSize: 10,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                  ],
+                                ),
                               ],
                             ),
                           ],
                         ),
-                        
+
                         // Additional actions
                         if (!isPremium)
                           Padding(
@@ -725,29 +1076,37 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                                       Navigator.push(
                                         context,
                                         MaterialPageRoute(
-                                          builder: (context) => MediaViewerPage(
-                                            albumId: widget.albumId,
-                                            initialMediaIndex: index,
-                                            mediaList: mediaList,
-                                            cachedMedia: cachedMedia,
-                                          ),
+                                          builder:
+                                              (context) => MediaViewerPage(
+                                                albumId: widget.albumId,
+                                                initialMediaIndex: index,
+                                                mediaList: mediaList,
+                                              ),
                                         ),
                                       );
                                     },
                                   )
-                                else
+                                else if (!isOffline)
                                   OutlinedButton.icon(
-                                    icon: isDownloading
-                                        ? SizedBox(
-                                            width: 16,
-                                            height: 16,
-                                            child: CircularProgressIndicator(
-                                              strokeWidth: 2,
-                                            ),
-                                          )
-                                        : Icon(Icons.download),
-                                    label: Text(isDownloading ? 'Downloading...' : 'Download'),
-                                    onPressed: isDownloading ? null : () => downloadMedia(index),
+                                    icon:
+                                        isDownloading
+                                            ? SizedBox(
+                                              width: 16,
+                                              height: 16,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                              ),
+                                            )
+                                            : Icon(Icons.download),
+                                    label: Text(
+                                      isDownloading
+                                          ? 'Downloading...'
+                                          : 'Download',
+                                    ),
+                                    onPressed:
+                                        isDownloading
+                                            ? null
+                                            : () => downloadMedia(index),
                                   ),
                               ],
                             ),

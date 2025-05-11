@@ -1,353 +1,352 @@
 import 'dart:ui';
+import 'package:blurspace/models/album_model.dart';
+import 'package:blurspace/providers/album_provider.dart';
+import 'package:blurspace/providers/cache_provider.dart';
+import 'package:blurspace/providers/connectivity_provider.dart';
+import 'package:blurspace/utils/colors.dart';
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 import 'package:cached_network_image/cached_network_image.dart';
-import 'album_detail_page.dart'; // Pastikan file ini ada
 
-class AlbumListPage extends StatefulWidget {
-  @override
-  _AlbumListPageState createState() => _AlbumListPageState();
-}
+import 'album_detail_page.dart';
 
-class _AlbumListPageState extends State<AlbumListPage> {
-  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-  bool isLoading = true;
-  List<Map<String, dynamic>> albums = [];
-  Map<String, List<Map<String, dynamic>>> albumMedia = {};
+class AlbumListPage extends ConsumerWidget {
+  const AlbumListPage({Key? key}) : super(key: key);
 
   @override
-  void initState() {
-    super.initState();
-    fetchAlbums();
-  }
+  Widget build(BuildContext context, WidgetRef ref) {
+    final albumsAsync = ref.watch(albumsNotifierProvider);
+    final isOffline = ref.watch(isOfflineProvider);
+    final lastSyncTime = ref.watch(lastSyncTimeProvider);
 
-  Future<void> fetchAlbums() async {
-    setState(() {
-      isLoading = true;
-    });
-
-    try {
-      // Fetch all albums
-      final QuerySnapshot albumSnapshot = await _firestore
-          .collection('albums')
-          .orderBy('createdAt', descending: true)
-          .get();
-
-      final List<Map<String, dynamic>> fetchedAlbums = [];
-      final Map<String, List<Map<String, dynamic>>> fetchedAlbumMedia = {};
-
-      // Process each album
-      for (final doc in albumSnapshot.docs) {
-        final albumData = doc.data() as Map<String, dynamic>;
-        final String albumId = doc.id;
-
-        // Only include unlocked albums
-        if (!(albumData['isLocked'] ?? false)) {
-          fetchedAlbums.add({
-            ...albumData,
-            'albumId': albumId,
-          });
-
-          // Fetch a preview of media (maximum 5)
-          final QuerySnapshot mediaSnapshot = await _firestore
-              .collection('albums')
-              .doc(albumId)
-              .collection('media')
-              .limit(5)
-              .get();
-
-          final List<Map<String, dynamic>> mediaList = [];
-          bool hasPremiumMedia = false;
-
-          for (final mediaDoc in mediaSnapshot.docs) {
-            final mediaData = mediaDoc.data() as Map<String, dynamic>;
-            mediaList.add(mediaData);
-            
-            // Check if any media is premium
-            if (mediaData['isPremium'] == true) {
-              hasPremiumMedia = true;
+    return SafeArea(
+      child: Scaffold(
+        body: albumsAsync.when(
+          loading: () => const Center(child: CircularProgressIndicator()),
+          error: (error, stackTrace) => _buildErrorState(context, error, ref),
+          data: (albums) {
+            if (albums.isEmpty) {
+              return _buildEmptyState(context, isOffline, ref);
             }
-          }
-
-          // Add hasPremiumMedia flag to album data
-          final int albumIndex = fetchedAlbums.length - 1;
-          fetchedAlbums[albumIndex]['hasPremiumMedia'] = hasPremiumMedia;
-          
-          // Store media for this album
-          fetchedAlbumMedia[albumId] = mediaList;
-        }
-      }
-
-      setState(() {
-        albums = fetchedAlbums;
-        albumMedia = fetchedAlbumMedia;
-        isLoading = false;
-      });
-    } catch (e) {
-      print('Error fetching albums: $e');
-      setState(() {
-        isLoading = false;
-      });
-      
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: ${e.toString()}')),
-      );
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text('Albums'),
-        actions: [
-          IconButton(
-            icon: Icon(Icons.refresh),
-            onPressed: fetchAlbums,
-          ),
-          IconButton(
-            icon: Icon(Icons.cloud_upload),
-            onPressed: () {
-              // Navigate to TeraBox uploader
-              Navigator.pushNamed(context, '/uploader');
-            },
-          ),
-        ],
+            return _buildAlbumList(context, albums, isOffline, lastSyncTime, ref);
+          },
+        ),
       ),
-      body: isLoading
-          ? Center(child: CircularProgressIndicator())
-          : albums.isEmpty
-              ? _buildEmptyState()
-              : _buildAlbumList(),
     );
   }
-  
-  Widget _buildEmptyState() {
+
+  Widget _buildErrorState(BuildContext context, Object error, WidgetRef ref) {
+    // Show error state and retry button
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.photo_album_outlined, size: 64, color: Colors.grey),
-          SizedBox(height: 16),
+          const Icon(Icons.error_outline, size: 64, color: Colors.red),
+          const SizedBox(height: 16),
           Text(
-            'No Albums Found',
-            style: TextStyle(
+            'Error loading albums',
+            style: GoogleFonts.poppins(
               fontSize: 18,
               fontWeight: FontWeight.bold,
             ),
           ),
-          SizedBox(height: 8),
+          const SizedBox(height: 8),
           Text(
-            'Upload some content from TeraBox',
-            style: TextStyle(color: Colors.grey),
+            error.toString(),
+            style: GoogleFonts.poppins(color: Colors.grey),
+            textAlign: TextAlign.center,
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
           ),
-          SizedBox(height: 24),
+          const SizedBox(height: 24),
           ElevatedButton.icon(
-            icon: Icon(Icons.cloud_upload),
-            label: Text('Upload Content'),
-            onPressed: () {
-              // Navigate to TeraBox uploader
-              Navigator.pushNamed(context, '/uploader');
-            },
+            icon: const Icon(Icons.refresh),
+            label: const Text('Retry'),
+            onPressed: () => ref.refresh(albumsNotifierProvider),
           ),
         ],
       ),
     );
   }
-  
-  Widget _buildAlbumList() {
-    return RefreshIndicator(
-      onRefresh: fetchAlbums,
-      child: ListView.builder(
-        padding: EdgeInsets.all(16),
-        itemCount: albums.length,
-        itemBuilder: (context, index) {
-          final album = albums[index];
-          final albumId = album['albumId'];
-          final media = albumMedia[albumId] ?? [];
-          final bool hasPremiumMedia = album['hasPremiumMedia'] ?? false;
-          
-          // Format date
-          final DateTime createdAt = DateTime.parse(album['createdAt']);
-          final String formattedDate = DateFormat('dd MMM yyyy').format(createdAt);
-          
-          return GestureDetector(
-            onTap: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => AlbumDetailPage(albumId: albumId),
+
+  Widget _buildEmptyState(BuildContext context, bool isOffline, WidgetRef ref) {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(
+            isOffline ? Icons.cloud_off : Icons.photo_album_outlined,
+            size: 64,
+            color: Colors.grey,
+          ),
+          const SizedBox(height: 16),
+          Text(
+            isOffline ? 'No Cached Albums' : 'No Albums Found',
+            style: GoogleFonts.poppins(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            isOffline
+                ? 'Connect to the internet to download albums'
+                : 'Upload some content from TeraBox',
+            style: GoogleFonts.poppins(color: Colors.grey),
+          ),
+          const SizedBox(height: 24),
+          if (!isOffline)
+            ElevatedButton.icon(
+              icon: const Icon(Icons.cloud_upload),
+              label: const Text('Upload Content'),
+              onPressed: () {
+                // Navigate to TeraBox uploader
+                Navigator.pushNamed(context, '/uploader');
+              },
+            ),
+          if (isOffline)
+            ElevatedButton.icon(
+              icon: const Icon(Icons.refresh),
+              label: const Text('Check Connection'),
+              onPressed: () => ref.read(connectivityStatusProvider.notifier).checkConnectivity(),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAlbumList(
+    BuildContext context,
+    List<Album> albums,
+    bool isOffline,
+    AsyncValue<DateTime?> lastSyncTime,
+    WidgetRef ref,
+  ) {
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 10),
+          child: SizedBox(
+            width: double.infinity,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Media Indonesia',
+                  style: GoogleFonts.poppins(
+                    color: white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
-              ).then((_) {
-                // Refresh albums when returning from detail page
-                fetchAlbums();
-              });
-            },
-            child: Card(
-              margin: EdgeInsets.only(bottom: 16),
-              elevation: 4,
-              clipBehavior: Clip.antiAlias,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Padding(
-                    padding: EdgeInsets.all(16),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                lastSyncTime.when(
+                  loading: () => const SizedBox(),
+                  error: (_, __) => const SizedBox(),
+                  data: (syncTime) {
+                    if (syncTime == null) return const SizedBox();
+                    return Row(
                       children: [
+                        Icon(
+                          isOffline ? Icons.cloud_off : Icons.sync,
+                          size: 16,
+                          color: white,
+                        ),
+                        const SizedBox(width: 8),
                         Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
+                          child: Text(
+                            isOffline
+                                ? 'Offline mode. Last synced: ${DateFormat('MMM d, y h:mm a').format(syncTime)}'
+                                : 'Last synced: ${DateFormat('MMM d, y h:mm a').format(syncTime)}',
+                            style: TextStyle(fontSize: 12, color: white),
+                          ),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+        ),
+
+        // Album list
+        Expanded(
+          child: RefreshIndicator(
+            onRefresh: () => ref.read(albumsNotifierProvider.notifier).refreshAlbums(),
+            child: ListView.builder(
+              padding: const EdgeInsets.all(16),
+              itemCount: albums.length,
+              itemBuilder: (context, index) {
+                final album = albums[index];
+                final mediaList = album.media;
+                
+                // Format date
+                final String formattedDate = DateFormat('EEEE, dd MMMM yyyy').format(album.createdAt);
+
+                return GestureDetector(
+                  onTap: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => AlbumDetailPage(albumId: album.albumId),
+                      ),
+                    ).then((_) {
+                      // Refresh albums when returning from detail page
+                      ref.read(albumsNotifierProvider.notifier).refreshAlbums();
+                    });
+                  },
+                  child: Card(
+                    margin: const EdgeInsets.only(bottom: 16),
+                    elevation: 4,
+                    shadowColor: white.withAlpha(10),
+                    clipBehavior: Clip.antiAlias,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
                             children: [
-                              Text(
-                                album['title'] ?? 'Untitled Album',
-                                style: TextStyle(
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.bold,
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      album.title,
+                                      style: GoogleFonts.lato(
+                                        fontSize: 20,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      formattedDate,
+                                      style: GoogleFonts.lato(
+                                        color: Colors.white70,
+                                        fontSize: 12,
+                                      ),
+                                    ),
+                                  ],
                                 ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
                               ),
-                              SizedBox(height: 4),
-                              Text(
-                                formattedDate,
-                                style: TextStyle(
-                                  color: Colors.grey,
-                                  fontSize: 12,
-                                ),
+                              // Status labels
+                              Row(
+                                children: [
+                                  if (album.hasPremiumMedia)
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                        vertical: 4,
+                                      ),
+                                      margin: const EdgeInsets.only(right: 8),
+                                      decoration: BoxDecoration(
+                                        color: blue,
+                                        borderRadius: BorderRadius.circular(12),
+                                      ),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          const Icon(
+                                            Icons.star,
+                                            color: white,
+                                            size: 16,
+                                          ),
+                                          const SizedBox(width: 4),
+                                          Text(
+                                            'Pro',
+                                            style: GoogleFonts.poppins(
+                                              color: white,
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 12,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                ],
                               ),
                             ],
                           ),
                         ),
-                        if (hasPremiumMedia)
-                          Container(
-                            padding: EdgeInsets.symmetric(
-                              horizontal: 8,
-                              vertical: 4,
-                            ),
-                            decoration: BoxDecoration(
-                              color: Colors.amber.shade200,
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  Icons.star,
-                                  color: Colors.amber.shade800,
-                                  size: 16,
-                                ),
-                                SizedBox(width: 4),
-                                Text(
-                                  'Premium',
-                                  style: TextStyle(
-                                    color: Colors.amber.shade800,
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 12,
+                        if (mediaList.isNotEmpty)
+                          SizedBox(
+                            height: 120,
+                            child: ListView.builder(
+                              scrollDirection: Axis.horizontal,
+                              itemCount: mediaList.length,
+                              itemBuilder: (context, mediaIndex) {
+                                final media = mediaList[mediaIndex];
+                                
+                                return Container(
+                                  width: 160,
+                                  margin: EdgeInsets.only(
+                                    left: mediaIndex == 0 ? 16 : 8,
+                                    right: mediaIndex == mediaList.length - 1 ? 16 : 0,
+                                    bottom: 16,
                                   ),
-                                ),
-                              ],
+                                  decoration: BoxDecoration(
+                                    borderRadius: BorderRadius.circular(8),
+                                    color: blue,
+                                  ),
+                                  clipBehavior: Clip.antiAlias,
+                                  child: Stack(
+                                    fit: StackFit.expand,
+                                    children: [
+                                      // Thumbnail image
+                                      CachedNetworkImage(
+                                        imageUrl: media.thumbnailUrl,
+                                        fit: BoxFit.cover,
+                                        placeholder: (context, url) => const Center(
+                                          child: CircularProgressIndicator(),
+                                        ),
+                                        errorWidget: (context, url, error) => Center(
+                                          child: Icon(
+                                            media.mediaType == 'video'
+                                                ? Icons.video_file
+                                                : Icons.image,
+                                            size: 40,
+                                            color: Colors.grey,
+                                          ),
+                                        ),
+                                      ),
+
+                                      // Blur effect for premium content
+                                      if (media.isPremium)
+                                        ClipRRect(
+                                          child: BackdropFilter(
+                                            filter: ImageFilter.blur(
+                                              sigmaX: 10,
+                                              sigmaY: 10,
+                                            ),
+                                            child: const Center(
+                                              child: Icon(
+                                                Icons.lock_outline_rounded,
+                                                color: Colors.white,
+                                                size: 30,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                );
+                              },
                             ),
                           ),
                       ],
                     ),
                   ),
-                  if (media.isNotEmpty)
-                    Container(
-                      height: 120,
-                      child: ListView.builder(
-                        scrollDirection: Axis.horizontal,
-                        itemCount: media.length,
-                        itemBuilder: (context, mediaIndex) {
-                          final mediaItem = media[mediaIndex];
-                          final bool isPremium = mediaItem['isPremium'] ?? false;
-                          
-                          return Container(
-                            width: 160,
-                            margin: EdgeInsets.only(
-                              left: mediaIndex == 0 ? 16 : 8,
-                              right: mediaIndex == media.length - 1 ? 16 : 0,
-                              bottom: 16,
-                            ),
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(8),
-                              color: Colors.grey.shade200,
-                            ),
-                            clipBehavior: Clip.antiAlias,
-                            child: Stack(
-                              fit: StackFit.expand,
-                              children: [
-                                // Thumbnail image
-                                CachedNetworkImage(
-                                  imageUrl: mediaItem['thumbnailUrl'] ?? '',
-                                  fit: BoxFit.cover,
-                                  placeholder: (context, url) => Center(
-                                    child: CircularProgressIndicator(),
-                                  ),
-                                  errorWidget: (context, url, error) => Center(
-                                    child: Icon(
-                                      mediaItem['mediaType'] == 'video'
-                                          ? Icons.video_file
-                                          : Icons.image,
-                                      size: 40,
-                                      color: Colors.grey,
-                                    ),
-                                  ),
-                                ),
-                                
-                                // Blur effect for premium content
-                                if (isPremium)
-                                  ClipRRect(
-                                    child: BackdropFilter(
-                                      filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
-                                      child: Container(
-                                        color: Colors.black.withOpacity(0.3),
-                                        child: Center(
-                                          child: Icon(
-                                            Icons.lock,
-                                            color: Colors.white,
-                                            size: 32,
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                  
-                                // Media type indicator
-                                Positioned(
-                                  right: 8,
-                                  bottom: 8,
-                                  child: Container(
-                                    padding: EdgeInsets.all(4),
-                                    decoration: BoxDecoration(
-                                      color: Colors.black.withOpacity(0.6),
-                                      borderRadius: BorderRadius.circular(4),
-                                    ),
-                                    child: Icon(
-                                      mediaItem['mediaType'] == 'video'
-                                          ? Icons.play_arrow
-                                          : Icons.image,
-                                      color: Colors.white,
-                                      size: 16,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-                ],
-              ),
+                );
+              },
             ),
-          );
-        },
-      ),
+          ),
+        ),
+      ],
     );
   }
 }

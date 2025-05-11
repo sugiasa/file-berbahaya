@@ -1,22 +1,22 @@
 // ignore_for_file: use_key_in_widget_constructors
 
+import 'dart:io';
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import '../providers/cache_manager.dart';
 
 class MediaViewerPage extends StatefulWidget {
   final String albumId;
   final int initialMediaIndex;
   final List<Map<String, dynamic>> mediaList;
-  final Map<String, dynamic> cachedMedia;
 
   MediaViewerPage({
     required this.albumId,
     required this.initialMediaIndex,
     required this.mediaList,
-    required this.cachedMedia,
   });
 
   @override
@@ -33,6 +33,12 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
   bool isFullScreen = false;
   bool showControls = true;
 
+  // Cache manager instance
+  final CacheManager _cacheManager = CacheManager();
+
+  // Map to store local file paths
+  Map<String, String> localMediaPaths = {};
+
   @override
   void initState() {
     super.initState();
@@ -48,19 +54,32 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
     ]);
 
     // Initialize with the first media
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _loadMedia(currentIndex);
-      _scrollToSelectedThumbnail();
+    _preloadLocalPaths().then((_) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _loadMedia(currentIndex);
+        _scrollToSelectedThumbnail();
+      });
     });
+  }
+
+  // Preload all local file paths for cached media
+  Future<void> _preloadLocalPaths() async {
+    for (final media in widget.mediaList) {
+      final mediaId = media['mediaId'];
+      if (media['isDownloaded'] == true) {
+        final localPath = await _cacheManager.getCachedMediaPath(mediaId);
+        if (localPath != null) {
+          localMediaPaths[mediaId] = localPath;
+        }
+      }
+    }
   }
 
   @override
   void dispose() {
     // Reset to portrait only
-    SystemChrome.setPreferredOrientations([
-      DeviceOrientation.portraitUp,
-    ]);
-    
+    SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+
     _pageController.dispose();
     _thumbnailScrollController.dispose();
     _videoPlayerController?.dispose();
@@ -72,8 +91,11 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
     if (_thumbnailScrollController.hasClients) {
       final double screenWidth = MediaQuery.of(context).size.width;
       final double thumbnailWidth = 80.0; // Width of each thumbnail
-      final double offset = currentIndex * thumbnailWidth - (screenWidth / 2) + (thumbnailWidth / 2);
-      
+      final double offset =
+          currentIndex * thumbnailWidth -
+          (screenWidth / 2) +
+          (thumbnailWidth / 2);
+
       _thumbnailScrollController.animateTo(
         offset < 0 ? 0 : offset,
         duration: Duration(milliseconds: 300),
@@ -81,13 +103,13 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
       );
     }
   }
-  
+
   void _loadMedia(int index) {
     final media = widget.mediaList[index];
     final mediaId = media['mediaId'];
     final isDownloaded = media['isDownloaded'] ?? false;
     final isPremium = media['isPremium'] ?? false;
-    
+
     // Clean up previous video controller
     if (_videoPlayerController != null) {
       _videoPlayerController!.dispose();
@@ -97,47 +119,50 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
         isVideoLoading = false;
       });
     }
-    
+
     // Don't load premium content or non-downloaded content
     if (isPremium || !isDownloaded) {
       return;
     }
-    
-    // Get cached media
-    final cachedMediaItem = widget.cachedMedia[mediaId];
-    if (cachedMediaItem == null) {
+
+    // Get local file path
+    final localPath = localMediaPaths[mediaId];
+    if (localPath == null) {
+      debugPrint('Error: Local path not found for media $mediaId');
       return;
     }
-    
-    final mediaUrl = cachedMediaItem['mediaUrl'];
-    final mediaType = cachedMediaItem['mediaType'];
-    
+
+    final mediaType = media['mediaType'];
+
     // Load video if it's a video
-    if (mediaType == 'video' && mediaUrl != null) {
+    if (mediaType == 'video' && localPath.isNotEmpty) {
       setState(() {
         isVideoLoading = true;
       });
-      
-      _videoPlayerController = VideoPlayerController.networkUrl(Uri.parse(mediaUrl));
-      _videoPlayerController!.initialize().then((_) {
-        if (mounted) {
-          setState(() {
-            isVideoInitialized = true;
-            isVideoLoading = false;
+
+      _videoPlayerController = VideoPlayerController.file(File(localPath));
+      _videoPlayerController!
+          .initialize()
+          .then((_) {
+            if (mounted) {
+              setState(() {
+                isVideoInitialized = true;
+                isVideoLoading = false;
+              });
+              _videoPlayerController!.play();
+            }
+          })
+          .catchError((error) {
+            debugPrint('Error initializing video: $error');
+            if (mounted) {
+              setState(() {
+                isVideoLoading = false;
+              });
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Error playing video: $error')),
+              );
+            }
           });
-          _videoPlayerController!.play();
-        }
-      }).catchError((error) {
-        print('Error initializing video: $error');
-        if (mounted) {
-          setState(() {
-            isVideoLoading = false;
-          });
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Error playing video: $error')),
-          );
-        }
-      });
     }
   }
 
@@ -162,23 +187,26 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
     return Scaffold(
       extendBodyBehindAppBar: true,
       backgroundColor: Colors.black,
-      appBar: showControls && !isFullScreen
-          ? AppBar(
-              backgroundColor: Colors.black.withOpacity(0.5),
-              elevation: 0,
-              iconTheme: IconThemeData(color: Colors.white),
-              title: Text(
-                widget.mediaList[currentIndex]['name'] ?? 'Media Viewer',
-                style: TextStyle(color: Colors.white),
-              ),
-              actions: [
-                IconButton(
-                  icon: Icon(isFullScreen ? Icons.fullscreen_exit : Icons.fullscreen),
-                  onPressed: _toggleFullScreen,
+      appBar:
+          showControls && !isFullScreen
+              ? AppBar(
+                backgroundColor: Colors.black.withOpacity(0.5),
+                elevation: 0,
+                iconTheme: IconThemeData(color: Colors.white),
+                title: Text(
+                  widget.mediaList[currentIndex]['name'] ?? 'Media Viewer',
+                  style: TextStyle(color: Colors.white),
                 ),
-              ],
-            )
-          : null,
+                actions: [
+                  IconButton(
+                    icon: Icon(
+                      isFullScreen ? Icons.fullscreen_exit : Icons.fullscreen,
+                    ),
+                    onPressed: _toggleFullScreen,
+                  ),
+                ],
+              )
+              : null,
       body: GestureDetector(
         onTap: () {
           setState(() {
@@ -193,11 +221,9 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
               left: 0,
               right: 0,
               height: MediaQuery.of(context).padding.top,
-              child: Container(
-                color: Colors.black.withOpacity(0.5),
-              ),
+              child: Container(color: Colors.black.withOpacity(0.5)),
             ),
-            
+
             // Main content viewer
             PageView.builder(
               controller: _pageController,
@@ -214,7 +240,7 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                 final mediaId = media['mediaId'];
                 final bool isPremium = media['isPremium'] ?? false;
                 final bool isDownloaded = media['isDownloaded'] ?? false;
-                
+
                 if (isPremium) {
                   // Premium content view
                   return Center(
@@ -231,28 +257,29 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                                 fit: BoxFit.contain,
                                 width: double.infinity,
                                 height: 300,
-                                placeholder: (context, url) => Center(
-                                  child: CircularProgressIndicator(),
-                                ),
-                                errorWidget: (context, url, error) => Icon(
-                                  Icons.image_not_supported,
-                                  size: 100,
-                                  color: Colors.white,
-                                ),
+                                placeholder:
+                                    (context, url) => Center(
+                                      child: CircularProgressIndicator(),
+                                    ),
+                                errorWidget:
+                                    (context, url, error) => Icon(
+                                      Icons.image_not_supported,
+                                      size: 100,
+                                      color: Colors.white,
+                                    ),
                               ),
                               BackdropFilter(
-                                filter: ImageFilter.blur(sigmaX: 20.0, sigmaY: 20.0),
+                                filter: ImageFilter.blur(
+                                  sigmaX: 20.0,
+                                  sigmaY: 20.0,
+                                ),
                                 child: Container(
                                   color: Colors.black.withOpacity(0.5),
                                   width: double.infinity,
                                   height: 300,
                                 ),
                               ),
-                              Icon(
-                                Icons.lock,
-                                size: 80,
-                                color: Colors.white,
-                              ),
+                              Icon(Icons.lock, size: 80, color: Colors.white),
                             ],
                           ),
                           SizedBox(height: 24),
@@ -267,21 +294,25 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                           SizedBox(height: 16),
                           Text(
                             'Subscribe to access premium content',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 16,
-                            ),
+                            style: TextStyle(color: Colors.white, fontSize: 16),
                           ),
                           SizedBox(height: 24),
                           ElevatedButton(
                             style: ElevatedButton.styleFrom(
                               backgroundColor: Colors.amber,
-                              padding: EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                              padding: EdgeInsets.symmetric(
+                                horizontal: 32,
+                                vertical: 16,
+                              ),
                             ),
                             onPressed: () {
                               // Handle subscription
                               ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(content: Text('Subscription feature coming soon')),
+                                SnackBar(
+                                  content: Text(
+                                    'Subscription feature coming soon',
+                                  ),
+                                ),
                               );
                             },
                             child: Text(
@@ -302,18 +333,11 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                     child: Column(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        Icon(
-                          Icons.download,
-                          size: 80,
-                          color: Colors.white,
-                        ),
+                        Icon(Icons.download, size: 80, color: Colors.white),
                         SizedBox(height: 24),
                         Text(
-                          'Media not cached',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 20,
-                          ),
+                          'Media not downloaded',
+                          style: TextStyle(color: Colors.white, fontSize: 20),
                         ),
                         SizedBox(height: 16),
                         ElevatedButton(
@@ -326,42 +350,41 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                     ),
                   );
                 } else {
-                  // Get cached media
-                  final cachedMediaItem = widget.cachedMedia[mediaId];
-                  if (cachedMediaItem == null) {
+                  // Get local file path
+                  final localPath = localMediaPaths[mediaId];
+                  if (localPath == null) {
                     return Center(
                       child: Text(
-                        'Media not found in cache',
+                        'Media file not found',
                         style: TextStyle(color: Colors.white),
                       ),
                     );
                   }
-                  
-                  final mediaUrl = cachedMediaItem['mediaUrl'];
-                  final mediaType = cachedMediaItem['mediaType'];
-                  
+
+                  final mediaType = media['mediaType'];
+
                   if (mediaType == 'video') {
                     // Video player
                     if (isVideoLoading) {
-                      return Center(
-                        child: CircularProgressIndicator(),
-                      );
-                    } else if (isVideoInitialized && _videoPlayerController != null) {
+                      return Center(child: CircularProgressIndicator());
+                    } else if (isVideoInitialized &&
+                        _videoPlayerController != null) {
                       return Center(
                         child: AspectRatio(
-                          aspectRatio: _videoPlayerController!.value.aspectRatio,
+                          aspectRatio:
+                              _videoPlayerController!.value.aspectRatio,
                           child: Stack(
                             alignment: Alignment.bottomCenter,
                             children: [
                               VideoPlayer(_videoPlayerController!),
-                              
+
                               // Video controls
                               if (showControls)
                                 _VideoControlsOverlay(
                                   controller: _videoPlayerController!,
                                   onTap: _togglePlayPause,
                                 ),
-                                
+
                               // Video progress
                               if (showControls)
                                 Positioned(
@@ -374,22 +397,34 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                                     child: VideoProgressIndicator(
                                       _videoPlayerController!,
                                       allowScrubbing: true,
-                                      padding: EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                                      padding: EdgeInsets.symmetric(
+                                        horizontal: 20,
+                                        vertical: 10,
+                                      ),
                                       colors: VideoProgressColors(
                                         playedColor: Colors.amber,
-                                        bufferedColor: Colors.white.withOpacity(0.3),
-                                        backgroundColor: Colors.white.withOpacity(0.1),
+                                        bufferedColor: Colors.white.withOpacity(
+                                          0.3,
+                                        ),
+                                        backgroundColor: Colors.white
+                                            .withOpacity(0.1),
                                       ),
                                     ),
                                   ),
                                 ),
-                              
+
                               // Center play/pause button
                               GestureDetector(
                                 onTap: _togglePlayPause,
                                 child: Center(
                                   child: AnimatedOpacity(
-                                    opacity: showControls && !_videoPlayerController!.value.isPlaying ? 1.0 : 0.0,
+                                    opacity:
+                                        showControls &&
+                                                !_videoPlayerController!
+                                                    .value
+                                                    .isPlaying
+                                            ? 1.0
+                                            : 0.0,
                                     duration: Duration(milliseconds: 300),
                                     child: Container(
                                       decoration: BoxDecoration(
@@ -419,32 +454,31 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                       );
                     }
                   } else {
-                    // Image viewer
+                    // Image viewer - use local file
                     return Center(
                       child: InteractiveViewer(
                         minScale: 0.5,
                         maxScale: 4.0,
-                        child: CachedNetworkImage(
-                          imageUrl: mediaUrl,
+                        child: Image.file(
+                          File(localPath),
                           fit: BoxFit.contain,
-                          placeholder: (context, url) => Center(
-                            child: CircularProgressIndicator(),
-                          ),
-                          errorWidget: (context, url, error) => Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Icon(
-                                Icons.error_outline,
-                                size: 60,
-                                color: Colors.red,
-                              ),
-                              SizedBox(height: 16),
-                              Text(
-                                'Error loading image',
-                                style: TextStyle(color: Colors.white),
-                              ),
-                            ],
-                          ),
+                          errorBuilder: (context, error, stackTrace) {
+                            return Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(
+                                  Icons.error_outline,
+                                  size: 60,
+                                  color: Colors.red,
+                                ),
+                                SizedBox(height: 16),
+                                Text(
+                                  'Error loading image: $error',
+                                  style: TextStyle(color: Colors.white),
+                                ),
+                              ],
+                            );
+                          },
                         ),
                       ),
                     );
@@ -452,20 +486,23 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                 }
               },
             ),
-            
+
             // Bottom thumbnail navigation
             if (showControls && !isFullScreen)
               Positioned(
                 left: 0,
                 right: 0,
-                bottom: 0,
+                bottom: 20,
                 child: Container(
                   height: 120,
                   decoration: BoxDecoration(
                     gradient: LinearGradient(
                       begin: Alignment.topCenter,
                       end: Alignment.bottomCenter,
-                      colors: [Colors.transparent, Colors.black.withOpacity(0.8)],
+                      colors: [
+                        Colors.transparent,
+                        Colors.black.withOpacity(0.8),
+                      ],
                     ),
                   ),
                   child: Column(
@@ -485,7 +522,9 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                               ),
                             ),
                             Text(
-                              widget.mediaList[currentIndex]['mediaType']?.toUpperCase() ?? 'MEDIA',
+                              widget.mediaList[currentIndex]['mediaType']
+                                      ?.toUpperCase() ??
+                                  'MEDIA',
                               style: TextStyle(
                                 color: Colors.white,
                                 fontWeight: FontWeight.bold,
@@ -495,36 +534,53 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                         ),
                       ),
                       SizedBox(height: 8),
-                      
+
                       // Thumbnail carousel
                       Container(
                         height: 80,
                         child: ListView.builder(
                           controller: _thumbnailScrollController,
                           scrollDirection: Axis.horizontal,
-                          padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                          padding: EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 4,
+                          ),
                           itemCount: widget.mediaList.length,
                           itemBuilder: (context, index) {
                             final media = widget.mediaList[index];
                             final bool isPremium = media['isPremium'] ?? false;
+                            final bool isDownloaded =
+                                media['isDownloaded'] ?? false;
                             final bool isSelected = index == currentIndex;
-                            
+
                             return GestureDetector(
                               onTap: () {
-                                _pageController.animateToPage(
-                                  index,
-                                  duration: Duration(milliseconds: 300),
-                                  curve: Curves.easeInOut,
-                                );
+                                if (isDownloaded) {
+                                  _pageController.animateToPage(
+                                    index,
+                                    duration: Duration(milliseconds: 300),
+                                    curve: Curves.easeInOut,
+                                  );
+                                } else {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text('Content not downloaded'),
+                                    ),
+                                  );
+                                }
                               },
                               child: Container(
                                 width: 70,
                                 margin: EdgeInsets.symmetric(horizontal: 4),
                                 decoration: BoxDecoration(
                                   borderRadius: BorderRadius.circular(8),
-                                  border: isSelected
-                                      ? Border.all(color: Colors.amber, width: 2)
-                                      : null,
+                                  border:
+                                      isSelected
+                                          ? Border.all(
+                                            color: Colors.amber,
+                                            width: 2,
+                                          )
+                                          : null,
                                 ),
                                 clipBehavior: Clip.antiAlias,
                                 child: Stack(
@@ -533,32 +589,39 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                                     CachedNetworkImage(
                                       imageUrl: media['thumbnailUrl'] ?? '',
                                       fit: BoxFit.cover,
-                                      placeholder: (context, url) => Center(
-                                        child: CircularProgressIndicator(
-                                          strokeWidth: 2,
-                                        ),
-                                      ),
-                                      errorWidget: (context, url, error) => Container(
-                                        color: Colors.grey[800],
-                                        child: Center(
-                                          child: Icon(
-                                            media['mediaType'] == 'video'
-                                                ? Icons.video_file
-                                                : Icons.image,
-                                            color: Colors.white,
-                                            size: 24,
+                                      placeholder:
+                                          (context, url) => Center(
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                            ),
                                           ),
-                                        ),
-                                      ),
+                                      errorWidget:
+                                          (context, url, error) => Container(
+                                            color: Colors.grey[800],
+                                            child: Center(
+                                              child: Icon(
+                                                media['mediaType'] == 'video'
+                                                    ? Icons.video_file
+                                                    : Icons.image,
+                                                color: Colors.white,
+                                                size: 24,
+                                              ),
+                                            ),
+                                          ),
                                     ),
-                                    
+
                                     // Blur effect for premium content
                                     if (isPremium)
                                       ClipRRect(
                                         child: BackdropFilter(
-                                          filter: ImageFilter.blur(sigmaX: 5, sigmaY: 5),
+                                          filter: ImageFilter.blur(
+                                            sigmaX: 5,
+                                            sigmaY: 5,
+                                          ),
                                           child: Container(
-                                            color: Colors.black.withOpacity(0.3),
+                                            color: Colors.black.withOpacity(
+                                              0.3,
+                                            ),
                                             child: Center(
                                               child: Icon(
                                                 Icons.lock,
@@ -569,17 +632,35 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                                           ),
                                         ),
                                       ),
-                                    
+
+                                    // Not downloaded overlay
+                                    if (!isDownloaded && !isPremium)
+                                      Container(
+                                        color: Colors.black.withOpacity(0.6),
+                                        child: Center(
+                                          child: Icon(
+                                            Icons.download,
+                                            color: Colors.white,
+                                            size: 20,
+                                          ),
+                                        ),
+                                      ),
+
                                     // Media type indicator
-                                    if (media['mediaType'] == 'video')
+                                    if (media['mediaType'] == 'video' &&
+                                        isDownloaded)
                                       Positioned(
                                         right: 4,
                                         bottom: 4,
                                         child: Container(
                                           padding: EdgeInsets.all(2),
                                           decoration: BoxDecoration(
-                                            color: Colors.black.withOpacity(0.6),
-                                            borderRadius: BorderRadius.circular(4),
+                                            color: Colors.black.withOpacity(
+                                              0.6,
+                                            ),
+                                            borderRadius: BorderRadius.circular(
+                                              4,
+                                            ),
                                           ),
                                           child: Icon(
                                             Icons.play_arrow,
@@ -588,7 +669,7 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                                           ),
                                         ),
                                       ),
-                                      
+
                                     // Selected indicator highlight
                                     if (isSelected)
                                       Container(
@@ -597,7 +678,9 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                                             color: Colors.amber,
                                             width: 2,
                                           ),
-                                          borderRadius: BorderRadius.circular(8),
+                                          borderRadius: BorderRadius.circular(
+                                            8,
+                                          ),
                                         ),
                                       ),
                                   ],
@@ -611,7 +694,7 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                   ),
                 ),
               ),
-              
+
             // Top media controls when in fullscreen
             if (showControls && isFullScreen)
               Positioned(
@@ -629,7 +712,10 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                     gradient: LinearGradient(
                       begin: Alignment.topCenter,
                       end: Alignment.bottomCenter,
-                      colors: [Colors.black.withOpacity(0.8), Colors.transparent],
+                      colors: [
+                        Colors.black.withOpacity(0.8),
+                        Colors.transparent,
+                      ],
                     ),
                   ),
                   child: Row(
@@ -642,7 +728,8 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                         },
                       ),
                       Text(
-                        widget.mediaList[currentIndex]['name'] ?? 'Media Viewer',
+                        widget.mediaList[currentIndex]['name'] ??
+                            'Media Viewer',
                         style: TextStyle(
                           color: Colors.white,
                           fontWeight: FontWeight.bold,
@@ -669,10 +756,7 @@ class _VideoControlsOverlay extends StatelessWidget {
   final VideoPlayerController controller;
   final VoidCallback onTap;
 
-  const _VideoControlsOverlay({
-    required this.controller,
-    required this.onTap,
-  });
+  const _VideoControlsOverlay({required this.controller, required this.onTap});
 
   String _formatDuration(Duration duration) {
     String twoDigits(int n) => n.toString().padLeft(2, '0');
@@ -689,14 +773,16 @@ class _VideoControlsOverlay extends StatelessWidget {
         Center(
           child: IconButton(
             icon: Icon(
-              controller.value.isPlaying ? Icons.pause_circle_outline : Icons.play_circle_outline,
+              controller.value.isPlaying
+                  ? Icons.pause_circle_outline
+                  : Icons.play_circle_outline,
               color: Colors.white,
               size: 60,
             ),
             onPressed: onTap,
           ),
         ),
-        
+
         // Bottom controls
         Positioned(
           left: 0,
@@ -718,7 +804,7 @@ class _VideoControlsOverlay extends StatelessWidget {
                   },
                 ),
               ),
-              
+
               // Playback speed
               Container(
                 padding: EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -737,19 +823,31 @@ class _VideoControlsOverlay extends StatelessWidget {
                     return [
                       PopupMenuItem(
                         value: 0.5,
-                        child: Text('0.5x', style: TextStyle(color: Colors.white)),
+                        child: Text(
+                          '0.5x',
+                          style: TextStyle(color: Colors.white),
+                        ),
                       ),
                       PopupMenuItem(
                         value: 1.0,
-                        child: Text('1.0x', style: TextStyle(color: Colors.white)),
+                        child: Text(
+                          '1.0x',
+                          style: TextStyle(color: Colors.white),
+                        ),
                       ),
                       PopupMenuItem(
                         value: 1.5,
-                        child: Text('1.5x', style: TextStyle(color: Colors.white)),
+                        child: Text(
+                          '1.5x',
+                          style: TextStyle(color: Colors.white),
+                        ),
                       ),
                       PopupMenuItem(
                         value: 2.0,
-                        child: Text('2.0x', style: TextStyle(color: Colors.white)),
+                        child: Text(
+                          '2.0x',
+                          style: TextStyle(color: Colors.white),
+                        ),
                       ),
                     ];
                   },
@@ -759,7 +857,7 @@ class _VideoControlsOverlay extends StatelessWidget {
                   ),
                 ),
               ),
-              
+
               // Total duration
               Padding(
                 padding: EdgeInsets.symmetric(horizontal: 10),
